@@ -534,10 +534,10 @@ st.markdown(f"""
 # ── Pipeline overview cards ────────────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
 steps = [
-    ("01", "PDF Table Extract",  "pdfplumber reads Schedule A table directly — zero LLM, zero hallucination"),
-    ("02", "Email A — LLM",      "Schema-locked prompt extracts songs from Email A (Creative Dept)"),
-    ("03", "Email B — LLM",      "Schema-locked prompt extracts songs from Email B (Artist Management)"),
-    ("04", "Python Merge",       "Field-by-field: PDF wins every conflict. Only PDF-listed songs in output"),
+    ("01", "PDF Text Extract",  "pdfplumber pulls raw Schedule A page text — avoids column mis-detection"),
+    ("02", "AI Parses PDF",     "LLM reads raw text with track-number anchors — handles wrapped cells correctly"),
+    ("03", "AI Parses Emails",  "Schema-locked prompt extracts songs from both emails"),
+    ("04", "Python Merge",      "ISRC-first matching · PDF wins every conflict · emails fill gaps only"),
 ]
 for col, (num, title, desc) in zip([col1, col2, col3, col4], steps):
     with col:
@@ -706,30 +706,36 @@ if "pipeline_result" in st.session_state:
 
     # ── Raw extractions (optional) ─────────────────────────────────────────────
     if show_raw_extraction:
-        st.markdown(f'<div class="wc-section">Raw LLM Extractions (Email sources only)</div>', unsafe_allow_html=True)
-        r2, r3 = st.columns(2)
-        with r2:
-            st.markdown(f'<span class="source-email">Email A (LLM)</span>', unsafe_allow_html=True)
-            with st.expander(f"{n_ea} songs extracted", expanded=False):
+        st.markdown(f'<div class="wc-section">PDF Raw Text (Schedule A page)</div>', unsafe_allow_html=True)
+        with st.expander("View extracted PDF text (input to LLM)", expanded=False):
+            pdf_raw = result.get("pdf_raw_text", "")
+            st.markdown(
+                f'<div class="code-block">{pdf_raw}</div>',
+                unsafe_allow_html=True,
+            )
+        st.markdown(f'<div class="wc-section">LLM Parsed Output — PDF + Emails</div>', unsafe_allow_html=True)
+        rc1, rc2, rc3 = st.columns(3)
+        with rc1:
+            st.markdown(f'<span class="source-pdf">PDF (LLM parsed)</span>', unsafe_allow_html=True)
+            with st.expander(f"{n_pdf} songs", expanded=False):
+                st.markdown(
+                    f'<div class="code-block">{json.dumps(result.get("pdf_songs",[]), indent=2)}</div>',
+                    unsafe_allow_html=True,
+                )
+        with rc2:
+            st.markdown(f'<span class="source-email">Email A</span>', unsafe_allow_html=True)
+            with st.expander(f"{n_ea} songs", expanded=False):
                 st.markdown(
                     f'<div class="code-block">{json.dumps(result.get("email_a_songs",[]), indent=2)}</div>',
                     unsafe_allow_html=True,
                 )
-        with r3:
-            st.markdown(f'<span class="source-email">Email B (LLM)</span>', unsafe_allow_html=True)
-            with st.expander(f"{n_eb} songs extracted", expanded=False):
+        with rc3:
+            st.markdown(f'<span class="source-email">Email B</span>', unsafe_allow_html=True)
+            with st.expander(f"{n_eb} songs", expanded=False):
                 st.markdown(
                     f'<div class="code-block">{json.dumps(result.get("email_b_songs",[]), indent=2)}</div>',
                     unsafe_allow_html=True,
                 )
-
-    if show_raw_extraction:
-        st.markdown(f'<div class="wc-section">PDF Table Extraction (Structural — no LLM)</div>', unsafe_allow_html=True)
-        with st.expander(f"{n_pdf} rows extracted directly from table", expanded=False):
-            st.markdown(
-                f'<div class="code-block">{json.dumps(result.get("pdf_songs",[]), indent=2)}</div>',
-                unsafe_allow_html=True,
-            )
 
     # ── Conflict + Fill log ────────────────────────────────────────────────────
     conflict_log = result.get("conflict_log", [])
