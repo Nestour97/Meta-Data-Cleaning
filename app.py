@@ -534,10 +534,10 @@ st.markdown(f"""
 # ── Pipeline overview cards ────────────────────────────────────────────────────
 col1, col2, col3, col4 = st.columns(4)
 steps = [
-    ("01", "Source Ingestion", "PDF agreement + 2 emails loaded as raw text inputs"),
-    ("02", "AI Extraction", "LLM parses structured song metadata from each source separately"),
-    ("03", "Conflict Resolution", "PDF wins on conflicts. Emails fill missing PDF fields"),
-    ("04", "Validate & Export", "ISRCs → LLRRR-YY-NNNNN. Dates → YYYY-MM-DD. Clean CSV"),
+    ("01", "PDF Table Extract",  "pdfplumber reads Schedule A table directly — zero LLM, zero hallucination"),
+    ("02", "Email A — LLM",      "Schema-locked prompt extracts songs from Email A (Creative Dept)"),
+    ("03", "Email B — LLM",      "Schema-locked prompt extracts songs from Email B (Artist Management)"),
+    ("04", "Python Merge",       "Field-by-field: PDF wins every conflict. Only PDF-listed songs in output"),
 ]
 for col, (num, title, desc) in zip([col1, col2, col3, col4], steps):
     with col:
@@ -683,58 +683,74 @@ if "pipeline_result" in st.session_state:
     <div class="stats-strip">
       <div class="stat-item">
         <div class="stat-num">{n_pdf}</div>
-        <div class="stat-label">PDF Songs</div>
+        <div class="stat-label">PDF (table)</div>
       </div>
       <div class="stat-item">
         <div class="stat-num">{n_ea}</div>
-        <div class="stat-label">Email A Songs</div>
+        <div class="stat-label">Email A (LLM)</div>
       </div>
       <div class="stat-item">
         <div class="stat-num">{n_eb}</div>
-        <div class="stat-label">Email B Songs</div>
+        <div class="stat-label">Email B (LLM)</div>
       </div>
       <div class="stat-item">
         <div class="stat-num" style="color:{'#82c596' if n_issues==0 else GOLD}">{n_out}</div>
-        <div class="stat-label">Clean Output Rows</div>
+        <div class="stat-label">Output Rows</div>
       </div>
       <div class="stat-item">
         <div class="stat-num" style="color:{'#82c596' if n_issues==0 else '#f5c28a'}">{n_issues}</div>
-        <div class="stat-label">Validation Flags</div>
+        <div class="stat-label">Flags</div>
       </div>
     </div>
     """, unsafe_allow_html=True)
 
     # ── Raw extractions (optional) ─────────────────────────────────────────────
     if show_raw_extraction:
-        st.markdown(f'<div class="wc-section">Raw LLM Extractions (Debug)</div>', unsafe_allow_html=True)
-        r1, r2, r3 = st.columns(3)
-        with r1:
-            st.markdown(f'<span class="source-pdf">PDF Agreement</span>', unsafe_allow_html=True)
-            with st.expander(f"{n_pdf} songs extracted", expanded=False):
-                st.markdown(
-                    f'<div class="code-block">{json.dumps(result.get("pdf_songs",[]), indent=2)}</div>',
-                    unsafe_allow_html=True,
-                )
+        st.markdown(f'<div class="wc-section">Raw LLM Extractions (Email sources only)</div>', unsafe_allow_html=True)
+        r2, r3 = st.columns(2)
         with r2:
-            st.markdown(f'<span class="source-email">Email A</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="source-email">Email A (LLM)</span>', unsafe_allow_html=True)
             with st.expander(f"{n_ea} songs extracted", expanded=False):
                 st.markdown(
                     f'<div class="code-block">{json.dumps(result.get("email_a_songs",[]), indent=2)}</div>',
                     unsafe_allow_html=True,
                 )
         with r3:
-            st.markdown(f'<span class="source-email">Email B</span>', unsafe_allow_html=True)
+            st.markdown(f'<span class="source-email">Email B (LLM)</span>', unsafe_allow_html=True)
             with st.expander(f"{n_eb} songs extracted", expanded=False):
                 st.markdown(
                     f'<div class="code-block">{json.dumps(result.get("email_b_songs",[]), indent=2)}</div>',
                     unsafe_allow_html=True,
                 )
 
-    if show_merge_debug:
-        st.markdown(f'<div class="wc-section">Merged (Pre-Validation) JSON</div>', unsafe_allow_html=True)
-        with st.expander("View merged JSON", expanded=False):
+    if show_raw_extraction:
+        st.markdown(f'<div class="wc-section">PDF Table Extraction (Structural — no LLM)</div>', unsafe_allow_html=True)
+        with st.expander(f"{n_pdf} rows extracted directly from table", expanded=False):
             st.markdown(
-                f'<div class="code-block">{json.dumps(result.get("merged_songs",[]), indent=2)}</div>',
+                f'<div class="code-block">{json.dumps(result.get("pdf_songs",[]), indent=2)}</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Conflict + Fill log ────────────────────────────────────────────────────
+    conflict_log = result.get("conflict_log", [])
+    fill_log = result.get("fill_log", [])
+
+    if conflict_log:
+        st.markdown(f'<div class="wc-section">Conflict Resolution Log — PDF Won</div>', unsafe_allow_html=True)
+        for line in conflict_log:
+            st.markdown(
+                f'<div style="font-family:DM Mono,monospace;font-size:11px;color:{ORANGE};'
+                f'padding:4px 0;border-bottom:1px solid {BLACK3};line-height:1.5">{line.strip()}</div>',
+                unsafe_allow_html=True,
+            )
+
+    if fill_log and show_merge_debug:
+        st.markdown(f'<div class="wc-section">Gap-Fill Log — Email Data Used</div>', unsafe_allow_html=True)
+        for line in fill_log:
+            color = GREY2 if "MISSING" not in line else RED
+            st.markdown(
+                f'<div style="font-family:DM Mono,monospace;font-size:11px;color:{color};'
+                f'padding:4px 0;border-bottom:1px solid {BLACK3};line-height:1.5">{line.strip()}</div>',
                 unsafe_allow_html=True,
             )
 
