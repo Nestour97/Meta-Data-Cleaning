@@ -524,7 +524,6 @@ with st.sidebar:
 st.markdown(f"""
 <div class="main-header">
   <div>
-    <div class="task-badge">Task 1</div>
     <div class="main-title">Metadata <span>Cleaning</span></div>
   </div>
   <div class="main-sub">Ingest · Extract · Merge · Validate · Deliver</div>
