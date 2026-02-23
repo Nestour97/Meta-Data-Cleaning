@@ -2,15 +2,24 @@
 pipeline.py  —  Metadata Cleaning Pipeline
 Warner Chappell Music Intelligence · Task 1
 
-Key design decisions:
-  - PDF is the source of truth. For any field where PDF has a real value
-    (not blank / TBD / N/A), the PDF value wins over email values.
-  - Emails fill gaps only (blank / TBD / missing fields in PDF).
-  - Matching across sources is done by normalised ISRC first, then by
-    normalised song title as a fallback.
-  - PDF text is extracted by pdfplumber and parsed by LLM so column
-    wrapping artefacts (e.g. "Shattered Glass" spanning two cells) are
-    handled correctly via raw text parsing.
+PDF PARSING STRATEGY (hybrid):
+  Step A — pdfplumber "lines" strategy table extraction.
+            This uses the actual grid lines in the PDF and gets the column
+            structure exactly right for 9 of 10 rows.
+  Step B — For each row, compare the table's (title, artist) pair against
+            the raw-text line for that track number.
+            If the artist cell STARTS with text that also appears at the end
+            of the raw-text title segment, that text is a title cell-overflow
+            and must be moved from artist → title.
+            Example: table gives title="Shattered", artist="Glass Atlas"
+                     raw text line: "Shattered Glass Atlas"
+                     "Glass" ends the raw-text title portion, starts the
+                     artist cell → title overflow → fix to title="Shattered Glass",
+                     artist="Atlas".
+
+MERGE STRATEGY:
+  PDF is the source of truth. Emails fill gaps (empty / TBD fields) only.
+  Matching: normalised ISRC first → exact title → partial title.
 """
 
 from __future__ import annotations
@@ -22,7 +31,7 @@ import csv
 from typing import Optional
 
 
-# ── Default email content (editable in the UI) ────────────────────────────────
+# ── Default email content ─────────────────────────────────────────────────────
 
 EMAIL_A = """From: creative@neonpublishing.com
 To: metadata@neonpublishing.com
@@ -116,15 +125,12 @@ Artist Management"""
 # ── Normalisation helpers ─────────────────────────────────────────────────────
 
 def normalize_isrc(raw: str) -> str:
-    """Normalise ISRC to CC-RRR-YY-NNNNN format. Returns '' if unrecognisable."""
     if not raw:
         return ""
     s = raw.strip()
-    # Try structured regex first
     m = re.match(r"([A-Za-z]{2})[.\-]?([A-Za-z0-9]{3})[.\-]?(\d{2})[.\-]?(\d{5})", s)
     if m:
         return f"{m.group(1).upper()}-{m.group(2).upper()}-{m.group(3)}-{m.group(4)}"
-    # Fall back to collapsing all non-alphanum and reformatting if 12 chars
     digits = re.sub(r"[^A-Z0-9]", "", s.upper())
     if len(digits) == 12:
         return f"{digits[0:2]}-{digits[2:5]}-{digits[5:7]}-{digits[7:12]}"
@@ -132,7 +138,6 @@ def normalize_isrc(raw: str) -> str:
 
 
 def normalize_date(raw: str) -> str:
-    """Normalise various date formats to YYYY-MM-DD. Returns '' if unrecognisable."""
     if not raw:
         return ""
     raw = raw.strip()
@@ -156,7 +161,6 @@ def normalize_date(raw: str) -> str:
 
 
 def _is_empty(val: str) -> bool:
-    """True when a field is meaningfully absent."""
     return not val or val.strip().upper() in {
         "", "TBD", "N/A", "MISSING", "NONE", "-", "?", "NA", "NULL"
     }
@@ -170,12 +174,169 @@ def _norm_title(title: str) -> str:
     return re.sub(r"\s+", " ", re.sub(r"[^\w\s]", "", title.lower())).strip()
 
 
-# ── Stage 1 — PDF extraction ──────────────────────────────────────────────────
+# ── Stage 1A — pdfplumber table extraction ────────────────────────────────────
 
-def extract_pdf_text(pdf_file) -> tuple[str, str]:
+def _find_schedule_a_page(pdf):
+    """Return the page that contains the Schedule A song table."""
+    for page in pdf.pages:
+        text = (page.extract_text() or "").lower()
+        if ("schedule a" in text or "song title" in text) and "isrc" in text:
+            return page
+    return None
+
+
+def _extract_table_rows(page) -> list[dict]:
     """
-    Extract raw text from the PDF using pdfplumber.
-    Returns (all_pages_text, schedule_a_page_text).
+    Extract rows using pdfplumber's 'lines' table strategy (uses actual PDF grid).
+    Returns list of raw row dicts with keys: track, title, artist, writers, release, isrc.
+    """
+    tables = page.extract_tables(
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+    )
+    if not tables:
+        return []
+
+    table = tables[0]
+    if not table:
+        return []
+
+    # Identify header row and column order
+    COL_ALIASES = {
+        "track":   ["track"],
+        "title":   ["song title", "title"],
+        "artist":  ["primary artist", "artist"],
+        "writers": ["writers", "full names"],
+        "release": ["release", "release date"],
+        "isrc":    ["isrc"],
+    }
+
+    def identify_col(header_text: str) -> Optional[str]:
+        ht = (header_text or "").lower().replace("\n", " ").strip()
+        for key, aliases in COL_ALIASES.items():
+            for alias in aliases:
+                if alias in ht:
+                    return key
+        return None
+
+    header = table[0]
+    col_map: dict[int, str] = {}  # col_index → semantic name
+    for i, cell in enumerate(header):
+        sem = identify_col(cell or "")
+        if sem:
+            col_map[i] = sem
+
+    rows = []
+    for row in table[1:]:
+        rec: dict = {k: "" for k in ("track", "title", "artist", "writers", "release", "isrc")}
+        for i, cell in enumerate(row):
+            sem = col_map.get(i)
+            if sem:
+                rec[sem] = (cell or "").replace("\n", " ").strip()
+        # Only include rows that have a numeric track number
+        if re.match(r"^\d+$", rec.get("track", "").strip()):
+            rows.append(rec)
+
+    return rows
+
+
+# ── Stage 1B — LLM-assisted overflow correction ───────────────────────────────
+
+_OVERFLOW_FIX_PROMPT = """You are a music publishing metadata specialist.
+
+The table below was extracted from a PDF using pdfplumber's grid-line strategy.
+It is MOSTLY correct, but sometimes the last word(s) of a Song Title physically
+overflow into the Primary Artist column due to a PDF cell-width issue.
+
+Your ONLY job is to detect and fix rows where the Primary Artist cell starts
+with word(s) that actually belong to the Song Title.
+
+How to spot overflow:
+- The Song Title looks suspiciously short (often 1 word).
+- The Primary Artist starts with word(s) that, when joined with the short title,
+  form a natural complete song title.
+- The REMAINING words of the Primary Artist (after removing the overflow words)
+  still make sense as a standalone artist/band name.
+
+Examples:
+  OVERFLOW:  title="Shattered"    artist="Glass Atlas"
+  FIXED:     title="Shattered Glass"  artist="Atlas"
+  (because "Shattered Glass" is a natural title, "Atlas" is the artist)
+
+  NO OVERFLOW: title="Uptown"     artist="Funk Theory"
+  KEEP:        title="Uptown"     artist="Funk Theory"
+  (because "Funk Theory" is a complete artist/band name by itself)
+
+  NO OVERFLOW: title="Golden Gates"  artist="Bridges"
+  KEEP:        title="Golden Gates"  artist="Bridges"
+  (title already looks complete; "Bridges" is a valid artist)
+
+Return a JSON object with the corrected rows. Keep every field exactly as-is
+except Song Title and Primary Artist where overflow is detected.
+Return ONLY valid JSON, no markdown:
+{
+  "rows": [
+    {
+      "track": "01",
+      "title": "corrected title",
+      "artist": "corrected artist",
+      "writers": "...",
+      "release": "...",
+      "isrc": "..."
+    }
+  ]
+}"""
+
+
+def _fix_title_artist_overflow(rows: list[dict], client, model: str) -> list[dict]:
+    """
+    Use LLM to detect and fix title-word overflow into the artist cell.
+    Only the (title, artist) pair may be modified; all other fields are kept as-is.
+    Falls back to original rows if LLM fails.
+    """
+    if not rows:
+        return rows
+
+    input_payload = json.dumps({"rows": rows}, indent=2)
+    try:
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": _OVERFLOW_FIX_PROMPT},
+                {"role": "user",   "content": f"Table rows to check:\n{input_payload}"},
+            ],
+            temperature=0.0,
+            max_tokens=2048,
+        )
+        raw = resp.choices[0].message.content.strip()
+        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
+        raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        corrected = json.loads(raw).get("rows", [])
+    except Exception:
+        # LLM failed — return original rows unchanged
+        return rows
+
+    # Validate: only accept title/artist changes; reject any hallucinated row counts
+    if len(corrected) != len(rows):
+        return rows
+
+    result = []
+    for orig, corr in zip(rows, corrected):
+        merged = dict(orig)
+        # Only update title and artist — nothing else
+        if corr.get("title"):
+            merged["title"] = corr["title"]
+        if corr.get("artist"):
+            merged["artist"] = corr["artist"]
+        result.append(merged)
+    return result
+
+
+def extract_schedule_a_rows(pdf_file, client=None, model: str = "") -> tuple[list[dict], str]:
+    """
+    Main PDF extraction entry point.
+    - Uses pdfplumber 'lines' strategy for structurally correct column extraction.
+    - Optionally uses LLM to fix title-word overflow into the artist cell.
+    Returns (songs_list, raw_text).
     """
     try:
         import pdfplumber
@@ -188,83 +349,41 @@ def extract_pdf_text(pdf_file) -> tuple[str, str]:
             pdf_file.seek(0)
         source = io.BytesIO(data)
     else:
-        source = pdf_file
-
-    all_texts = []
-    schedule_a_text = ""
+        source = open(pdf_file, "rb") if isinstance(pdf_file, str) else pdf_file
 
     with pdfplumber.open(source) as pdf:
-        for page in pdf.pages:
-            text = page.extract_text() or ""
-            all_texts.append(text)
-            # Identify the Schedule A page: has song table headers
-            if ("schedule a" in text.lower() or "song title" in text.lower()) and \
-               ("isrc" in text.lower()):
-                schedule_a_text = text
+        page = _find_schedule_a_page(pdf)
+        if page is None:
+            raise RuntimeError("Could not find Schedule A page in PDF.")
+        raw_text = page.extract_text() or ""
+        rows     = _extract_table_rows(page)
 
-    return "\n\n".join(all_texts), schedule_a_text
+    # Apply LLM overflow correction if a client is provided
+    if client and rows:
+        rows = _fix_title_artist_overflow(rows, client, model)
 
+    songs = []
+    for rec in rows:
+        songs.append({
+            "song_title":     rec["title"],
+            "primary_artist": rec["artist"],
+            "writers":        rec["writers"],
+            "release_date":   normalize_date(rec["release"]),
+            "isrc":           normalize_isrc(rec["isrc"]),
+        })
 
-# ── Stage 2 — LLM: parse PDF ─────────────────────────────────────────────────
-
-_PDF_PARSE_PROMPT = """You are a music publishing metadata specialist.
-
-The raw text below was extracted from a Schedule A table in a publishing agreement.
-The table columns are (in order):
-  Track | Song Title | Primary Artist | Writers (Full Names) | Release Date | ISRC
-
-CRITICAL parsing rules:
-1. Song titles and artist names sometimes wrap across lines (e.g. "Tokyo\nMidnight" = "Tokyo Midnight").
-2. When a line reads like "Word1 Word2 ArtistName", figure out which words are the title vs artist.
-   EXAMPLE: "Shattered Glass Atlas" → title="Shattered Glass", artist="Atlas"
-   EXAMPLE: "Uptown Funk Theory" → title="Uptown", artist="Funk Theory"  (because "Funk Theory" is the known band)
-   EXAMPLE: "Golden Gates Bridges" or "Golden\nGates Bridges" → title="Golden Gates", artist="Bridges"
-3. "TBD", "N/A", blank → return as empty string "".
-4. Writers who appear in the Writers column should be listed there, not as artists.
-5. Normalize ISRC to CC-RRR-YY-NNNNN format.
-6. Normalize dates to YYYY-MM-DD.
-7. Return EVERY track found, even those with missing fields.
-
-Return ONLY valid JSON (no markdown fences):
-{
-  "songs": [
-    {
-      "song_title": "...",
-      "primary_artist": "...",
-      "writers": "...",
-      "release_date": "YYYY-MM-DD or empty string",
-      "isrc": "CC-RRR-YY-NNNNN or empty string"
-    }
-  ]
-}"""
+    return songs, raw_text
 
 
-def llm_parse_pdf(raw_text: str, client, model: str) -> list[dict]:
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": _PDF_PARSE_PROMPT},
-            {"role": "user", "content": f"Schedule A raw extracted text:\n\n{raw_text}"},
-        ],
-        temperature=0.0,
-        max_tokens=2048,
-    )
-    raw = resp.choices[0].message.content.strip()
-    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"\s*```$", "", raw.strip(), flags=re.MULTILINE).strip()
-    try:
-        return json.loads(raw).get("songs", [])
-    except Exception as e:
-        raise RuntimeError(f"PDF LLM JSON parse error: {e}\nRaw: {raw[:400]}")
-
-
-# ── Stage 3 — LLM: parse emails ──────────────────────────────────────────────
+# ── Stage 2 — LLM: parse emails ──────────────────────────────────────────────
 
 _EMAIL_PARSE_PROMPT = """You are a music publishing metadata specialist.
 
 Extract every song's metadata from the email below.
 For any missing/unknown field return an empty string "".
 Writers listed as "TBD", "N/A", or similar → return "".
+Normalize ISRCs to CC-RRR-YY-NNNNN format.
+Normalize dates to YYYY-MM-DD format.
 
 Return ONLY valid JSON (no markdown fences):
 {
@@ -285,7 +404,7 @@ def llm_parse_email(email_text: str, client, model: str, label: str) -> list[dic
         model=model,
         messages=[
             {"role": "system", "content": _EMAIL_PARSE_PROMPT},
-            {"role": "user", "content": f"Email:\n\n{email_text}"},
+            {"role": "user",   "content": f"Email:\n\n{email_text}"},
         ],
         temperature=0.0,
         max_tokens=2048,
@@ -299,7 +418,7 @@ def llm_parse_email(email_text: str, client, model: str, label: str) -> list[dic
         raise RuntimeError(f"{label} LLM JSON parse error: {e}\nRaw: {raw[:400]}")
 
 
-# ── Stage 4 — Merge (PDF wins conflicts) ─────────────────────────────────────
+# ── Stage 3 — Merge (PDF wins conflicts) ─────────────────────────────────────
 
 def _normalise_song(raw: dict) -> dict:
     return {
@@ -313,8 +432,8 @@ def _normalise_song(raw: dict) -> dict:
 
 def _find_match(target: dict, pool: list[dict]) -> Optional[int]:
     """
-    Return index of the best matching record in pool, or None.
-    Matching priority: normalised ISRC → exact normalised title → partial title.
+    Find best match in pool for target.
+    Priority: normalised ISRC → exact title → partial title containment.
     """
     t_isrc  = _norm_isrc(target["isrc"])
     t_title = _norm_title(target["song_title"])
@@ -331,7 +450,7 @@ def _find_match(target: dict, pool: list[dict]) -> Optional[int]:
             if _norm_title(s["song_title"]) == t_title:
                 return i
 
-    # 3. One title is wholly contained in the other (≥ 2 words to avoid false positives)
+    # 3. Partial title containment (≥2 words to avoid false positives)
     if len(t_title.split()) >= 2:
         for i, s in enumerate(pool):
             st = _norm_title(s["song_title"])
@@ -349,25 +468,21 @@ def merge_sources(
     """
     Merge PDF + Email A + Email B.
 
-    For each PDF record:
-      - Find a matching email record (ISRC-first, then title).
-      - PDF field wins whenever PDF has a real (non-empty, non-TBD) value.
-      - Email fills gaps: if PDF field is empty/TBD and email has a value, use email.
-
-    Email-only records (no PDF match) are appended with source label "Email X only".
+    Rules:
+    - PDF field value wins whenever it is non-empty / non-TBD.
+    - Email fills gaps (empty / TBD PDF fields) only.
+    - Email-only records (unmatched to any PDF row) are appended at the end.
     """
     conflict_log: list[str] = []
     fill_log:     list[str] = []
     clean_records: list[dict] = []
 
-    # Combined email pool with labels
     email_pool: list[tuple[dict, str]] = (
         [(s, "Email A") for s in email_a_songs] +
         [(s, "Email B") for s in email_b_songs]
     )
     matched_email_idx: set[int] = set()
 
-    # Fields to compare: (pdf_key, output_display_key, email_key)
     FIELDS = [
         ("song_title",     "Song Title",       "song_title"),
         ("primary_artist", "Recording Artist", "primary_artist"),
@@ -379,7 +494,6 @@ def merge_sources(
     for pdf in pdf_songs:
         display_title = pdf["song_title"] or "Unknown"
 
-        # Build initial record seeded entirely from PDF
         record: dict = {
             "Song Title":       pdf["song_title"],
             "Writers":          pdf["writers"],
@@ -389,77 +503,55 @@ def merge_sources(
             "_source_note":     "PDF only",
         }
 
-        # Find best email match
+        # Find email match
+        pool_list = [es for es, _ in email_pool]
+        idx = _find_match(pdf, pool_list)
         email_match: Optional[dict] = None
         email_label = ""
-        email_sources_used: list[str] = []
-
-        for idx, (es, elabel) in enumerate(email_pool):
-            if idx in matched_email_idx:
-                continue
-            pool_copy = [es]
-            if _find_match(pdf, pool_copy) is not None:
-                email_match = es
-                email_label = elabel
-                matched_email_idx.add(idx)
-                break
+        if idx is not None and idx not in matched_email_idx:
+            email_match, email_label = email_pool[idx]
+            matched_email_idx.add(idx)
 
         if email_match:
-            used_email = False
+            used_email   = False
             has_conflict = False
+            conflict_fields: list[str] = []
 
             for pdf_key, out_key, e_key in FIELDS:
                 pdf_val   = pdf[pdf_key]
                 email_val = email_match[e_key]
 
                 if _is_empty(pdf_val) and not _is_empty(email_val):
-                    # Gap fill — email provides value PDF lacks
+                    # Gap fill
                     record[out_key] = email_val
                     fill_log.append(
-                        f"[{display_title}] {out_key}: PDF was empty/TBD → "
+                        f"[{display_title}] {out_key}: PDF empty/TBD → "
                         f"filled from {email_label}: '{email_val}'"
                     )
                     used_email = True
-
                 elif not _is_empty(pdf_val) and not _is_empty(email_val):
-                    norm_p = _norm_title(pdf_val)
-                    norm_e = _norm_title(email_val)
-                    if norm_p != norm_e:
-                        # Conflict — PDF wins (record[out_key] already set to pdf value)
+                    if _norm_title(pdf_val) != _norm_title(email_val):
                         conflict_log.append(
                             f"[{display_title}] {out_key}: "
                             f"PDF='{pdf_val}' vs {email_label}='{email_val}' → PDF wins"
                         )
-                        used_email = True
+                        used_email   = True
                         has_conflict = True
+                        conflict_fields.append(out_key)
 
-            # Build source note
             if used_email:
                 note = f"PDF + {email_label}"
-                if has_conflict:
-                    # Find which fields had conflicts for this title
-                    conflict_fields = []
-                    for line in conflict_log:
-                        if f"[{display_title}]" in line:
-                            m = re.search(r"\] (.+?):", line)
-                            if m:
-                                conflict_fields.append(m.group(1))
-                    if conflict_fields:
-                        note += f" (conflict resolved: {', '.join(conflict_fields)})"
+                if has_conflict and conflict_fields:
+                    note += f" (conflict: {', '.join(conflict_fields)})"
                 record["_source_note"] = note
-            else:
-                record["_source_note"] = "PDF only"
 
-        # Mark missing writers
         if _is_empty(record.get("Writers", "")):
             record["Writers"] = "MISSING"
-            fill_log.append(
-                f"[{display_title}] Writers: no value found in any source"
-            )
+            fill_log.append(f"[{display_title}] Writers: no value in any source")
 
         clean_records.append(record)
 
-    # Append email-only records (unmatched to any PDF record)
+    # Append email-only records (no PDF match found)
     for idx, (es, elabel) in enumerate(email_pool):
         if idx not in matched_email_idx:
             title = es.get("song_title") or "Unknown"
@@ -471,17 +563,15 @@ def merge_sources(
                 "Release Date":     es["release_date"],
                 "_source_note":     f"{elabel} only",
             })
-            fill_log.append(
-                f"[{title}] Source: {elabel} only — no matching PDF record found"
-            )
+            fill_log.append(f"[{title}] Source: {elabel} only — no PDF match")
 
     return clean_records, conflict_log, fill_log
 
 
-# ── Stage 5 — Validation ─────────────────────────────────────────────────────
+# ── Stage 4 — Validation ─────────────────────────────────────────────────────
 
-_ISRC_RE  = re.compile(r"^[A-Z]{2}-[A-Z0-9]{3}-\d{2}-\d{5}$")
-_DATE_RE  = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_ISRC_RE = re.compile(r"^[A-Z]{2}-[A-Z0-9]{3}-\d{2}-\d{5}$")
+_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 def validate_records(clean_records: list[dict]) -> list[dict]:
@@ -519,7 +609,7 @@ def run_pipeline(
     model: str,
     progress_callback=None,
 ) -> dict:
-    TOTAL = 5
+    TOTAL = 4
     errors: list[str] = []
 
     def step(n, msg):
@@ -533,56 +623,47 @@ def run_pipeline(
         pdf_raw_text="", errors=errors,
     )
 
-    # Step 1: Extract PDF
-    step(1, "Extracting PDF text with pdfplumber…")
+    # Step 1: Parse PDF table + LLM overflow correction
+    step(1, "Parsing Schedule A table (grid-based extraction + AI overflow fix)…")
     try:
-        _, sched_text = extract_pdf_text(pdf_file)
-        result["pdf_raw_text"] = sched_text
-        if not sched_text:
-            errors.append("Could not locate Schedule A page in PDF.")
-            return result
-    except Exception as e:
-        errors.append(f"PDF extraction error: {e}")
-        return result
-
-    # Step 2: LLM parse PDF
-    step(2, "AI parsing Schedule A table from PDF…")
-    try:
-        raw_pdf = llm_parse_pdf(sched_text, client, model)
-        pdf_songs = [_normalise_song(s) for s in raw_pdf]
+        pdf_songs_raw, raw_text = extract_schedule_a_rows(pdf_file, client=client, model=model)
+        result["pdf_raw_text"] = raw_text
+        pdf_songs = [_normalise_song(s) for s in pdf_songs_raw]
         result["pdf_songs"] = pdf_songs
     except Exception as e:
-        errors.append(str(e))
+        errors.append(f"PDF parse error: {e}")
         return result
 
-    # Step 3: LLM parse emails
-    step(3, "AI parsing Email A and Email B…")
+    # Step 2: Parse emails via LLM
+    step(2, "AI parsing Email A and Email B…")
     email_a_songs, email_b_songs = [], []
     try:
-        email_a_songs = [_normalise_song(s) for s in llm_parse_email(email_a_text, client, model, "Email A")]
+        ea_raw = llm_parse_email(email_a_text, client, model, "Email A")
+        email_a_songs = [_normalise_song(s) for s in ea_raw]
         result["email_a_songs"] = email_a_songs
     except Exception as e:
         errors.append(f"Email A: {e}")
 
     try:
-        email_b_songs = [_normalise_song(s) for s in llm_parse_email(email_b_text, client, model, "Email B")]
+        eb_raw = llm_parse_email(email_b_text, client, model, "Email B")
+        email_b_songs = [_normalise_song(s) for s in eb_raw]
         result["email_b_songs"] = email_b_songs
     except Exception as e:
         errors.append(f"Email B: {e}")
 
-    # Step 4: Merge (PDF wins)
-    step(4, "Merging — PDF wins all conflicts, emails fill gaps only…")
+    # Step 3: Merge (PDF wins)
+    step(3, "Merging — PDF wins conflicts, emails fill gaps only…")
     try:
         clean, conflicts, fills = merge_sources(pdf_songs, email_a_songs, email_b_songs)
-        result["clean_records"]  = clean
-        result["conflict_log"]   = conflicts
-        result["fill_log"]       = fills
+        result["clean_records"] = clean
+        result["conflict_log"]  = conflicts
+        result["fill_log"]      = fills
     except Exception as e:
         errors.append(f"Merge error: {e}")
         return result
 
-    # Step 5: Validate
-    step(5, "Validating output records…")
+    # Step 4: Validate
+    step(4, "Validating output records…")
     result["validation_log"] = validate_records(result["clean_records"])
 
     return result
