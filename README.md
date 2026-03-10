@@ -1,5 +1,4 @@
 # Task 1 — Metadata Cleaning Pipeline
-### AI Automation Analyst Assessment
 
 A production-grade Streamlit application that ingests song metadata from multiple unstructured sources (a PDF publishing agreement and two emails), resolves conflicts using a defined source hierarchy, and delivers a clean, validated CSV.
 
